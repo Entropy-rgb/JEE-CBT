@@ -2,11 +2,13 @@ import Link from "next/link"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "@/components/ui/card"
 import { ThemeToggle } from "@/components/theme-toggle"
+import { UserAuthButton } from "@/components/user-auth-button"
 
 export default function Home() {
   return (
     <div className="container flex flex-col items-center justify-center min-h-screen py-12">
-      <div className="absolute top-4 right-4">
+      <div className="absolute top-4 right-4 flex items-center gap-2">
+        <UserAuthButton />
         <ThemeToggle />
       </div>
 
