@@ -1,6 +1,7 @@
 "use client"
 
 import { Button } from "@/components/ui/button"
+import { useEffect } from "react"
 
 interface Question {
   id: number
@@ -16,6 +17,24 @@ interface QuestionPaletteProps {
 }
 
 export default function QuestionPalette({ questions, currentIndex, onQuestionClick }: QuestionPaletteProps) {
+  // Ensure question 1 is always marked as visited
+  useEffect(() => {
+    if (questions.length > 0 && !questions[0].isVisited) {
+      // Create a copy of the questions array
+      const updatedQuestions = [...questions]
+      updatedQuestions[0] = {
+        ...updatedQuestions[0],
+        isVisited: true,
+      }
+
+      // Use a custom event to notify the parent component
+      const event = new CustomEvent("questionOneVisited", {
+        detail: { updatedQuestions },
+      })
+      window.dispatchEvent(event)
+    }
+  }, [questions])
+
   const getQuestionStatus = (question: Question, index: number) => {
     if (index === currentIndex) return "current"
     // Add a new status for questions that are both answered and marked for review

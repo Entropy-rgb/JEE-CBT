@@ -44,31 +44,45 @@ export default function TestPage() {
   const router = useRouter()
   const { toast } = useToast()
   const { user } = useAuth()
-  const [questions, setQuestions] = useState<Question[]>([])
-  const [currentQuestionIndex, setCurrentQuestionIndex] = useState(0)
-  const [timeRemaining, setTimeRemaining] = useState(0)
-  const [testConfig, setTestConfig] = useState<any>(null)
-  const [showSubmitDialog, setShowSubmitDialog] = useState(false)
-  const [testSubmitted, setTestSubmitted] = useState(false)
-  const [isLoading, setIsLoading] = useState(true)
-  const [testStartTime, setTestStartTime] = useState<Date | null>(null)
-  const [questionStartTime, setQuestionStartTime] = useState<Date | null>(null)
-  const [isScreenshotMode, setIsScreenshotMode] = useState(false)
-  const [useServerStorage, setUseServerStorage] = useState(true)
-  const [lastSaved, setLastSaved] = useState<Date | null>(null)
 
-  // Auto-save interval reference
+  // Main state
+  const [testState, setTestState] = useState<{
+    questions: Question[]
+    currentQuestionIndex: number
+    timeRemaining: number
+    testConfig: any | null
+    testStartTime: Date | null
+    questionStartTime: Date | null
+    isScreenshotMode: boolean
+    useServerStorage: boolean
+    lastSaved: Date | null
+    isLoading: boolean
+    testSubmitted: boolean
+    showSubmitDialog: boolean
+  }>({
+    questions: [],
+    currentQuestionIndex: 0,
+    timeRemaining: 0,
+    testConfig: null,
+    testStartTime: null,
+    questionStartTime: null,
+    isScreenshotMode: false,
+    useServerStorage: true,
+    lastSaved: null,
+    isLoading: true,
+    testSubmitted: false,
+    showSubmitDialog: false,
+  })
+
+  // Refs to track component lifecycle and prevent memory leaks
+  const isMounted = useRef(true)
+  const testInitializedRef = useRef(false)
   const autoSaveIntervalRef = useRef<NodeJS.Timeout | null>(null)
 
-  // Reference to track if component is mounted
-  const isMounted = useRef(true)
-
-  // Reference to track if the test has been initialized
-  const testInitializedRef = useRef(false)
-
-  // Reference to store the current question data to prevent state loss
+  // Create a stable reference to the current question to prevent state loss
   const currentQuestionRef = useRef<Question | null>(null)
 
+  // Cleanup on unmount
   useEffect(() => {
     return () => {
       isMounted.current = false
@@ -78,7 +92,100 @@ export default function TestPage() {
     }
   }, [])
 
-  // Load saved test progress or initialize new test
+  // Function to save current progress to storage
+  const saveProgress = useCallback(
+    async (showToast = false) => {
+      const {
+        testConfig,
+        testSubmitted,
+        questions,
+        currentQuestionIndex,
+        timeRemaining,
+        testStartTime,
+        isScreenshotMode,
+        useServerStorage,
+        questionStartTime,
+      } = testState
+
+      if (!testConfig || testSubmitted || questions.length === 0) return
+
+      // Update time spent on current question before saving
+      let updatedQuestions = [...questions]
+      if (questionStartTime) {
+        const now = new Date()
+        const timeSpent = Math.floor((now.getTime() - questionStartTime.getTime()) / 1000)
+
+        // Only add reasonable time (less than the total test time)
+        const reasonableTime = Math.min(timeSpent, testConfig.timeInMinutes * 60 || 3600)
+
+        updatedQuestions = updatedQuestions.map((q, idx) => {
+          if (idx === currentQuestionIndex) {
+            return { ...q, timeSpent: q.timeSpent + reasonableTime }
+          }
+          return q
+        })
+
+        // Reset the question start time after calculating time spent
+        setTestState((prev) => ({
+          ...prev,
+          questionStartTime: now,
+        }))
+      }
+
+      const saveTime = new Date()
+      setTestState((prev) => ({
+        ...prev,
+        lastSaved: saveTime,
+        questions: updatedQuestions,
+      }))
+
+      const progressData = {
+        questions: updatedQuestions,
+        currentQuestionIndex,
+        timeRemaining,
+        testConfig,
+        testStartTime: testStartTime?.toISOString(),
+        isScreenshotMode,
+        lastSaved: saveTime.toISOString(),
+      }
+
+      try {
+        await StorageService.saveData(progressData, { useServerStorage })
+
+        // If user is logged in, also save to Supabase
+        if (user && user.id) {
+          try {
+            await supabase.from("test_progress").upsert({
+              user_id: user.id,
+              progress: progressData,
+              updated_at: new Date().toISOString(),
+            })
+          } catch (err) {
+            console.error("Error saving to Supabase:", err)
+          }
+        }
+
+        if (showToast) {
+          toast({
+            title: "Progress saved",
+            description: "Your test progress has been saved successfully.",
+          })
+        }
+      } catch (error) {
+        console.error("Error saving progress:", error)
+        if (showToast) {
+          toast({
+            title: "Error saving progress",
+            description: "There was an error saving your progress. Please try again.",
+            variant: "destructive",
+          })
+        }
+      }
+    },
+    [testState, user, supabase, toast],
+  )
+
+  // Load test configuration and saved progress
   useEffect(() => {
     const loadTest = async () => {
       if (testInitializedRef.current) return
@@ -93,9 +200,6 @@ export default function TestPage() {
         }
 
         const config = JSON.parse(configStr)
-        setTestConfig(config)
-        setIsScreenshotMode(config.isScreenshotMode || false)
-        setUseServerStorage(config.useServerStorage !== undefined ? config.useServerStorage : true)
 
         // Try to load saved progress from Supabase if user is logged in
         let savedProgress = null
@@ -136,20 +240,26 @@ export default function TestPage() {
             return q
           })
 
-          setQuestions(fixedQuestions)
           const startIndex = savedProgress.currentQuestionIndex || 0
-          setCurrentQuestionIndex(startIndex)
 
           // Set the current question reference
           if (fixedQuestions.length > 0 && fixedQuestions[startIndex]) {
             currentQuestionRef.current = fixedQuestions[startIndex]
           }
 
-          setTimeRemaining(savedProgress.timeRemaining || config.timeInMinutes * 60)
-          setTestStartTime(savedProgress.testStartTime ? new Date(savedProgress.testStartTime) : new Date())
-          setQuestionStartTime(new Date())
-          setLastSaved(savedProgress.lastSaved ? new Date(savedProgress.lastSaved) : null)
-          setIsLoading(false)
+          setTestState((prev) => ({
+            ...prev,
+            questions: fixedQuestions,
+            currentQuestionIndex: startIndex,
+            timeRemaining: savedProgress.timeRemaining || config.timeInMinutes * 60,
+            testConfig: config,
+            testStartTime: savedProgress.testStartTime ? new Date(savedProgress.testStartTime) : new Date(),
+            questionStartTime: new Date(),
+            isScreenshotMode: config.isScreenshotMode || false,
+            useServerStorage: config.useServerStorage !== undefined ? config.useServerStorage : true,
+            lastSaved: savedProgress.lastSaved ? new Date(savedProgress.lastSaved) : null,
+            isLoading: false,
+          }))
 
           toast({
             title: "Test progress restored",
@@ -159,9 +269,6 @@ export default function TestPage() {
         }
 
         // No saved progress, initialize new test
-        setTimeRemaining(config.timeInMinutes * 60)
-
-        // Generate empty questions based on configuration
         const generatedQuestions: Question[] = []
 
         // Set question types based on configuration type
@@ -204,21 +311,27 @@ export default function TestPage() {
           }
         }
 
-        setQuestions(generatedQuestions)
-
         // Set the current question reference
         if (generatedQuestions.length > 0) {
           currentQuestionRef.current = generatedQuestions[0]
         }
 
-        setIsLoading(false)
-        setTestStartTime(new Date())
-        setQuestionStartTime(new Date())
+        const initialSaveTime = new Date()
+
+        setTestState((prev) => ({
+          ...prev,
+          questions: generatedQuestions,
+          timeRemaining: config.timeInMinutes * 60,
+          testConfig: config,
+          testStartTime: new Date(),
+          questionStartTime: new Date(),
+          isScreenshotMode: config.isScreenshotMode || false,
+          useServerStorage: config.useServerStorage !== undefined ? config.useServerStorage : true,
+          lastSaved: initialSaveTime,
+          isLoading: false,
+        }))
 
         // Initial save of the test state
-        const initialSaveTime = new Date()
-        setLastSaved(initialSaveTime)
-
         const progressData = {
           questions: generatedQuestions,
           currentQuestionIndex: 0,
@@ -250,17 +363,40 @@ export default function TestPage() {
     }
 
     loadTest()
-  }, [router, toast, user])
+  }, [router, toast, user, saveProgress])
 
-  // Update currentQuestionRef when questions or currentQuestionIndex changes
+  // Update currentQuestionRef when questions changes
   useEffect(() => {
+    const { questions, currentQuestionIndex } = testState
     if (questions.length > 0 && currentQuestionIndex >= 0 && currentQuestionIndex < questions.length) {
       currentQuestionRef.current = questions[currentQuestionIndex]
     }
-  }, [questions, currentQuestionIndex])
+  }, [testState])
+
+  // Add this effect to listen for the custom event from QuestionPalette
+  // Add this right after the other useEffect hooks:
+
+  // Listen for the questionOneVisited event from QuestionPalette
+  useEffect(() => {
+    const handleQuestionOneVisited = (event: any) => {
+      const { updatedQuestions } = event.detail
+      if (updatedQuestions && updatedQuestions.length > 0) {
+        setTestState((prev) => ({
+          ...prev,
+          questions: updatedQuestions,
+        }))
+      }
+    }
+
+    window.addEventListener("questionOneVisited", handleQuestionOneVisited)
+    return () => {
+      window.removeEventListener("questionOneVisited", handleQuestionOneVisited)
+    }
+  }, [])
 
   // Set up auto-save functionality
   useEffect(() => {
+    const { isLoading, testSubmitted } = testState
     if (isLoading || testSubmitted) return
 
     // Save progress every 1 second
@@ -273,103 +409,11 @@ export default function TestPage() {
         clearInterval(autoSaveIntervalRef.current)
       }
     }
-  }, [isLoading, testSubmitted])
+  }, [testState.isLoading, testState.testSubmitted, saveProgress])
 
-  // Function to save current progress to storage
-  const saveProgress = async (showToast = false) => {
-    if (!testConfig || testSubmitted || questions.length === 0) return
-
-    // Update time spent on current question before saving
-    let updatedQuestions = [...questions]
-    if (questionStartTime) {
-      const now = new Date()
-      const timeSpent = Math.floor((now.getTime() - questionStartTime.getTime()) / 1000)
-
-      // Only add reasonable time (less than the total test time)
-      const reasonableTime = Math.min(timeSpent, testConfig.timeInMinutes * 60 || 3600)
-
-      updatedQuestions = updatedQuestions.map((q, idx) => {
-        if (idx === currentQuestionIndex) {
-          return { ...q, timeSpent: q.timeSpent + reasonableTime }
-        }
-        return q
-      })
-
-      // Reset the question start time after calculating time spent
-      setQuestionStartTime(now)
-    }
-
-    const saveTime = new Date()
-    setLastSaved(saveTime)
-
-    const progressData = {
-      questions: updatedQuestions,
-      currentQuestionIndex,
-      timeRemaining,
-      testConfig,
-      testStartTime: testStartTime?.toISOString(),
-      isScreenshotMode,
-      lastSaved: saveTime.toISOString(),
-    }
-
-    try {
-      await StorageService.saveData(progressData, { useServerStorage })
-
-      // If user is logged in, also save to Supabase
-      if (user && user.id) {
-        try {
-          await supabase.from("test_progress").upsert({
-            user_id: user.id,
-            progress: progressData,
-            updated_at: new Date().toISOString(),
-          })
-        } catch (err) {
-          console.error("Error saving to Supabase:", err)
-        }
-      }
-
-      // Update questions state with the updated time spent
-      setQuestions(updatedQuestions)
-
-      if (showToast) {
-        toast({
-          title: "Progress saved",
-          description: "Your test progress has been saved successfully.",
-        })
-      }
-    } catch (error) {
-      console.error("Error saving progress:", error)
-      if (showToast) {
-        toast({
-          title: "Error saving progress",
-          description: "There was an error saving your progress. Please try again.",
-          variant: "destructive",
-        })
-      }
-    }
-  }
-
-  // Update time spent on current question when changing questions
+  // Timer effect
   useEffect(() => {
-    if (questionStartTime && !isLoading && questions.length > 0) {
-      return () => {
-        if (isMounted.current) {
-          const now = new Date()
-          const timeSpent = Math.floor((now.getTime() - questionStartTime.getTime()) / 1000)
-
-          setQuestions((prevQuestions) => {
-            const updatedQuestions = [...prevQuestions]
-            if (updatedQuestions[currentQuestionIndex]) {
-              updatedQuestions[currentQuestionIndex].timeSpent += timeSpent
-            }
-            return updatedQuestions
-          })
-        }
-      }
-    }
-  }, [currentQuestionIndex, questionStartTime, isLoading, questions.length])
-
-  useEffect(() => {
+    const { timeRemaining, testConfig, isLoading, testSubmitted } = testState
     if (isLoading) return
 
     if (timeRemaining <= 0 && !testSubmitted) {
@@ -385,25 +429,33 @@ export default function TestPage() {
     }
 
     const timer = setInterval(() => {
-      setTimeRemaining((prev) => prev - 1)
+      setTestState((prev) => ({
+        ...prev,
+        timeRemaining: prev.timeRemaining - 1,
+      }))
     }, 1000)
 
     return () => clearInterval(timer)
-  }, [timeRemaining, testSubmitted, testConfig, router, isLoading])
+  }, [testState.timeRemaining, testState.testSubmitted, testState.testConfig, testState.isLoading, router])
 
   // Handle answer change for single correct questions
   const handleSingleCorrectAnswerChange = useCallback(
     (answer: string) => {
+      const { questions, currentQuestionIndex } = testState
       if (questions.length === 0) return
 
-      setQuestions((prevQuestions) => {
-        const updatedQuestions = [...prevQuestions]
+      // Update the state with the new answer
+      setTestState((prev) => {
+        const updatedQuestions = [...prev.questions]
         updatedQuestions[currentQuestionIndex] = {
           ...updatedQuestions[currentQuestionIndex],
           userAnswer: answer,
           isVisited: true,
         }
-        return updatedQuestions
+        return {
+          ...prev,
+          questions: updatedQuestions,
+        }
       })
 
       // Update the current question reference immediately
@@ -418,16 +470,17 @@ export default function TestPage() {
       // Save progress after state update
       setTimeout(() => saveProgress(false), 0)
     },
-    [currentQuestionIndex, questions.length],
+    [testState, saveProgress],
   )
 
   // Handle checkbox change for multiple correct questions
   const handleMultipleCorrectAnswerChange = useCallback(
     (option: string, checked: boolean) => {
+      const { questions, currentQuestionIndex } = testState
       if (questions.length === 0) return
 
-      setQuestions((prevQuestions) => {
-        const updatedQuestions = [...prevQuestions]
+      setTestState((prev) => {
+        const updatedQuestions = [...prev.questions]
         const currentQuestion = updatedQuestions[currentQuestionIndex]
 
         // Ensure userAnswer is an array
@@ -449,7 +502,10 @@ export default function TestPage() {
           isVisited: true,
         }
 
-        return updatedQuestions
+        return {
+          ...prev,
+          questions: updatedQuestions,
+        }
       })
 
       // Update the current question reference immediately
@@ -476,22 +532,26 @@ export default function TestPage() {
       // Save progress after state update
       setTimeout(() => saveProgress(false), 0)
     },
-    [currentQuestionIndex, questions.length],
+    [testState, saveProgress],
   )
 
   // Handle numerical answer change
   const handleNumericalAnswerChange = useCallback(
     (value: string) => {
+      const { questions, currentQuestionIndex } = testState
       if (questions.length === 0) return
 
-      setQuestions((prevQuestions) => {
-        const updatedQuestions = [...prevQuestions]
+      setTestState((prev) => {
+        const updatedQuestions = [...prev.questions]
         updatedQuestions[currentQuestionIndex] = {
           ...updatedQuestions[currentQuestionIndex],
           userAnswer: value,
           isVisited: true,
         }
-        return updatedQuestions
+        return {
+          ...prev,
+          questions: updatedQuestions,
+        }
       })
 
       // Update the current question reference immediately
@@ -506,15 +566,16 @@ export default function TestPage() {
       // Save progress after state update
       setTimeout(() => saveProgress(false), 0)
     },
-    [currentQuestionIndex, questions.length],
+    [testState, saveProgress],
   )
 
   // Add a new function to clear responses
   const handleClearResponse = useCallback(() => {
+    const { questions, currentQuestionIndex } = testState
     if (questions.length === 0) return
 
-    setQuestions((prevQuestions) => {
-      const updatedQuestions = [...prevQuestions]
+    setTestState((prev) => {
+      const updatedQuestions = [...prev.questions]
       const currentType = updatedQuestions[currentQuestionIndex].type
 
       // Set to appropriate empty value based on question type
@@ -530,7 +591,10 @@ export default function TestPage() {
         }
       }
 
-      return updatedQuestions
+      return {
+        ...prev,
+        questions: updatedQuestions,
+      }
     })
 
     // Update the current question reference immediately
@@ -552,19 +616,23 @@ export default function TestPage() {
 
     // Save progress after state update
     setTimeout(() => saveProgress(false), 0)
-  }, [currentQuestionIndex, questions.length])
+  }, [testState, saveProgress])
 
   const handleMarkForReview = useCallback(() => {
+    const { questions, currentQuestionIndex } = testState
     if (questions.length === 0) return
 
-    setQuestions((prevQuestions) => {
-      const updatedQuestions = [...prevQuestions]
+    setTestState((prev) => {
+      const updatedQuestions = [...prev.questions]
       updatedQuestions[currentQuestionIndex] = {
         ...updatedQuestions[currentQuestionIndex],
         isMarkedForReview: !updatedQuestions[currentQuestionIndex].isMarkedForReview,
         isVisited: true,
       }
-      return updatedQuestions
+      return {
+        ...prev,
+        questions: updatedQuestions,
+      }
     })
 
     // Update the current question reference immediately
@@ -578,95 +646,123 @@ export default function TestPage() {
 
     // Save progress after state update
     setTimeout(() => saveProgress(false), 0)
-  }, [currentQuestionIndex, questions.length])
+  }, [testState, saveProgress])
 
   // Fix the time tracking logic by resetting the question start time when changing questions
   const goToQuestion = useCallback(
     (index: number) => {
-      if (index >= 0 && index < questions.length) {
-        // Save the current question state before navigating
-        const currentQuestionData = currentQuestionRef.current || questions[currentQuestionIndex]
+      const { questions, currentQuestionIndex, questionStartTime, testConfig } = testState
+      if (index < 0 || index >= questions.length) return
 
-        // Update time spent on current question before changing
-        if (questionStartTime) {
-          const now = new Date()
-          const timeSpent = Math.floor((now.getTime() - questionStartTime.getTime()) / 1000)
+      // Save the current question state before navigating
+      const currentQuestionData = currentQuestionRef.current || questions[currentQuestionIndex]
 
-          // Only add the time if it's reasonable (less than the total test time)
-          const reasonableTime = Math.min(timeSpent, testConfig?.timeInMinutes * 60 || 3600)
+      // Update time spent on current question before changing
+      if (questionStartTime) {
+        const now = new Date()
+        const timeSpent = Math.floor((now.getTime() - questionStartTime.getTime()) / 1000)
 
-          setQuestions((prevQuestions) => {
-            const updatedQuestions = [...prevQuestions]
+        // Only add the time if it's reasonable (less than the total test time)
+        const reasonableTime = Math.min(timeSpent, testConfig?.timeInMinutes * 60 || 3600)
 
-            // Update current question with the latest data from ref
-            if (currentQuestionData) {
-              updatedQuestions[currentQuestionIndex] = {
-                ...currentQuestionData,
-                timeSpent: (currentQuestionData.timeSpent || 0) + reasonableTime,
-                isVisited: true,
-              }
-            } else {
-              // Fallback if ref is not available
-              updatedQuestions[currentQuestionIndex] = {
-                ...updatedQuestions[currentQuestionIndex],
-                timeSpent: updatedQuestions[currentQuestionIndex].timeSpent + reasonableTime,
-                isVisited: true,
-              }
-            }
+        setTestState((prev) => {
+          const updatedQuestions = [...prev.questions]
 
-            // Update destination question
-            updatedQuestions[index] = {
-              ...updatedQuestions[index],
+          // Always ensure question 1 is marked as visited
+          if (updatedQuestions[0]) {
+            updatedQuestions[0] = {
+              ...updatedQuestions[0],
               isVisited: true,
-              visitCount: updatedQuestions[index].visitCount + 1,
             }
+          }
 
-            return updatedQuestions
-          })
-        } else {
-          // If no questionStartTime, still mark questions as visited
-          setQuestions((prevQuestions) => {
-            const updatedQuestions = [...prevQuestions]
-
-            // Update current question with the latest data from ref
-            if (currentQuestionData) {
-              updatedQuestions[currentQuestionIndex] = {
-                ...currentQuestionData,
-                isVisited: true,
-              }
-            } else {
-              // Fallback if ref is not available
-              updatedQuestions[currentQuestionIndex] = {
-                ...updatedQuestions[currentQuestionIndex],
-                isVisited: true,
-              }
-            }
-
-            // Update destination question
-            updatedQuestions[index] = {
-              ...updatedQuestions[index],
+          // Update current question with the latest data from ref
+          if (currentQuestionData) {
+            updatedQuestions[currentQuestionIndex] = {
+              ...currentQuestionData,
+              timeSpent: (currentQuestionData.timeSpent || 0) + reasonableTime,
               isVisited: true,
-              visitCount: updatedQuestions[index].visitCount + 1,
             }
+          } else {
+            // Fallback if ref is not available
+            updatedQuestions[currentQuestionIndex] = {
+              ...updatedQuestions[currentQuestionIndex],
+              timeSpent: updatedQuestions[currentQuestionIndex].timeSpent + reasonableTime,
+              isVisited: true,
+            }
+          }
 
-            return updatedQuestions
-          })
-        }
+          // Update destination question
+          updatedQuestions[index] = {
+            ...updatedQuestions[index],
+            isVisited: true,
+            visitCount: updatedQuestions[index].visitCount + 1,
+          }
 
-        // Update current question index
-        setCurrentQuestionIndex(index)
+          return {
+            ...prev,
+            questions: updatedQuestions,
+            currentQuestionIndex: index,
+            questionStartTime: new Date(),
+          }
+        })
+      } else {
+        // If no questionStartTime, still mark questions as visited
+        setTestState((prev) => {
+          const updatedQuestions = [...prev.questions]
 
-        // Reset question start time
-        setQuestionStartTime(new Date())
+          // Update current question with the latest data from ref
+          if (currentQuestionData) {
+            updatedQuestions[currentQuestionIndex] = {
+              ...currentQuestionData,
+              isVisited: true,
+            }
+          } else {
+            // Fallback if ref is not available
+            updatedQuestions[currentQuestionIndex] = {
+              ...updatedQuestions[currentQuestionIndex],
+              isVisited: true,
+            }
+          }
 
-        // Save progress after state updates
-        setTimeout(() => saveProgress(false), 0)
+          // Update destination question
+          updatedQuestions[index] = {
+            ...updatedQuestions[index],
+            isVisited: true,
+            visitCount: updatedQuestions[index].visitCount + 1,
+          }
+
+          // Make sure question 1 is always marked as visited
+          if (updatedQuestions[0]) {
+            updatedQuestions[0].isVisited = true
+          }
+
+          return {
+            ...prev,
+            questions: updatedQuestions,
+            currentQuestionIndex: index,
+            questionStartTime: new Date(),
+          }
+        })
       }
+
+      // Save progress after state updates
+      setTimeout(() => saveProgress(false), 0)
     },
-    [currentQuestionIndex, questionStartTime, questions.length, testConfig],
+    [testState, saveProgress],
   )
 
   const handleSubmitTest = async () => {
+    const {
+      testConfig,
+      questions,
+      currentQuestionIndex,
+      questionStartTime,
+      testStartTime,
+      isScreenshotMode,
+      useServerStorage,
+    } = testState
+
     // Double check that testConfig exists before proceeding
     if (!testConfig) {
       console.error("Test configuration is missing")
@@ -680,14 +776,21 @@ export default function TestPage() {
       const now = new Date()
       const timeSpent = Math.floor((now.getTime() - questionStartTime.getTime()) / 1000)
 
-      setQuestions((prevQuestions) => {
-        const updatedQuestions = [...prevQuestions]
+      setTestState((prev) => {
+        const updatedQuestions = [...prev.questions]
         updatedQuestions[currentQuestionIndex].timeSpent += timeSpent
-        return updatedQuestions
+        return {
+          ...prev,
+          questions: updatedQuestions,
+          testSubmitted: true,
+        }
       })
+    } else {
+      setTestState((prev) => ({
+        ...prev,
+        testSubmitted: true,
+      }))
     }
-
-    setTestSubmitted(true)
 
     // Calculate total test time
     const testEndTime = new Date()
@@ -736,6 +839,37 @@ export default function TestPage() {
     }
   }
 
+  // Add this function right before the return statement:
+
+  // Force question 1 to be marked as visited
+  useEffect(() => {
+    // This effect runs on every render to ensure question 1 is always marked
+    if (testState.questions.length > 0 && !testState.questions[0].isVisited) {
+      setTestState((prev) => {
+        const updatedQuestions = [...prev.questions]
+        updatedQuestions[0] = {
+          ...updatedQuestions[0],
+          isVisited: true,
+        }
+        return {
+          ...prev,
+          questions: updatedQuestions,
+        }
+      })
+    }
+  }, [testState.questions])
+
+  const {
+    questions,
+    currentQuestionIndex,
+    timeRemaining,
+    isLoading,
+    testConfig,
+    lastSaved,
+    isScreenshotMode,
+    showSubmitDialog,
+  } = testState
+
   if (isLoading) {
     return <div className="flex items-center justify-center min-h-screen">Loading test...</div>
   }
@@ -754,12 +888,16 @@ export default function TestPage() {
 
   return (
     <div className="flex flex-col min-h-screen bg-background">
-      <TestHeader timeRemaining={timeRemaining} onSubmit={() => setShowSubmitDialog(true)} lastSaved={lastSaved} />
+      <TestHeader
+        timeRemaining={timeRemaining}
+        onSubmit={() => setTestState((prev) => ({ ...prev, showSubmitDialog: true }))}
+        lastSaved={lastSaved}
+      />
 
       <div className="flex flex-1 p-4">
         <div className="w-3/4 pr-4">
-          <Card className="p-6 h-full">
-            <div className="flex justify-between mb-4">
+          <Card className="p-6 h-full overflow-auto" key={`question-card-${currentQuestionIndex}`}>
+            <div className="flex justify-between mb-4 sticky top-0 bg-background pt-1 pb-3 z-10">
               <div className="font-medium">
                 Question {currentQuestionIndex + 1} of {questions.length}
               </div>
@@ -817,14 +955,17 @@ export default function TestPage() {
                 <RadioGroup
                   value={(currentQuestion.userAnswer as string) || ""}
                   onValueChange={handleSingleCorrectAnswerChange}
+                  className="space-y-3"
                 >
                   {["A", "B", "C", "D"].map((option, index) => (
                     <div
-                      key={`option-${currentQuestionIndex}-${index}-${option}`}
-                      className="flex items-center space-x-2"
+                      key={`option-${option}-${index}`}
+                      className="flex items-center space-x-2 p-2 rounded hover:bg-accent"
                     >
-                      <RadioGroupItem id={`option-${currentQuestionIndex}-${index}-${option}`} value={option} />
-                      <Label htmlFor={`option-${currentQuestionIndex}-${index}-${option}`}>Option {option}</Label>
+                      <RadioGroupItem id={`option-${option}-${index}`} value={option} />
+                      <Label htmlFor={`option-${option}-${index}`} className="cursor-pointer w-full">
+                        Option {option}
+                      </Label>
                     </div>
                   ))}
                 </RadioGroup>
@@ -841,17 +982,19 @@ export default function TestPage() {
 
                   return (
                     <div
-                      key={`option-${currentQuestionIndex}-${index}-${option}`}
-                      className="flex items-center space-x-2"
+                      key={`option-${option}-${index}`}
+                      className="flex items-center space-x-2 p-2 rounded hover:bg-accent"
                     >
                       <Checkbox
-                        id={`option-${currentQuestionIndex}-${index}-${option}`}
+                        id={`option-${option}-${index}`}
                         checked={currentAnswers.includes(option)}
                         onCheckedChange={(checked) => {
                           handleMultipleCorrectAnswerChange(option, checked === true)
                         }}
                       />
-                      <Label htmlFor={`option-${currentQuestionIndex}-${index}-${option}`}>Option {option}</Label>
+                      <Label htmlFor={`option-${option}-${index}`} className="cursor-pointer w-full">
+                        Option {option}
+                      </Label>
                     </div>
                   )
                 })}
@@ -860,9 +1003,9 @@ export default function TestPage() {
 
             {currentQuestion.type === "numerical" && (
               <div className="space-y-2">
-                <Label htmlFor={`numerical-answer-${currentQuestionIndex}`}>Enter numerical value:</Label>
+                <Label htmlFor="numerical-answer">Enter numerical value:</Label>
                 <Input
-                  id={`numerical-answer-${currentQuestionIndex}`}
+                  id="numerical-answer"
                   type="number"
                   step="any"
                   value={(currentQuestion.userAnswer as string) || ""}
@@ -889,13 +1032,20 @@ export default function TestPage() {
         <div className="w-1/4">
           <QuestionPalette questions={questions} currentIndex={currentQuestionIndex} onQuestionClick={goToQuestion} />
 
-          <Button className="w-full mt-4" variant="destructive" onClick={() => setShowSubmitDialog(true)}>
+          <Button
+            className="w-full mt-4"
+            variant="destructive"
+            onClick={() => setTestState((prev) => ({ ...prev, showSubmitDialog: true }))}
+          >
             Submit Test
           </Button>
         </div>
       </div>
 
-      <AlertDialog open={showSubmitDialog} onOpenChange={setShowSubmitDialog}>
+      <AlertDialog
+        open={showSubmitDialog}
+        onOpenChange={(open) => setTestState((prev) => ({ ...prev, showSubmitDialog: open }))}
+      >
         <AlertDialogContent>
           <AlertDialogHeader>
             <AlertDialogTitle>Submit Test</AlertDialogTitle>
